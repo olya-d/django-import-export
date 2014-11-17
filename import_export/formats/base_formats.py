@@ -114,7 +114,8 @@ class CSV(TablibFormat):
     TABLIB_MODULE = 'tablib.formats._csv'
 
     def get_read_mode(self):
-        return 'rU' if six.PY3 else 'rb'
+       # return 'rU' if six.PY3 else 'rb'
+       return 'rU'
 
     def is_binary(self):
         return False if six.PY3 else True
