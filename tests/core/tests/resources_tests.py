@@ -33,6 +33,7 @@ except ImportError:
 class MyResource(resources.Resource):
     name = fields.Field()
     email = fields.Field()
+    extra = fields.Field()
 
     class Meta:
         export_order = ('email', 'name')
@@ -57,8 +58,43 @@ class ResourceTestCase(TestCase):
 
     def test_get_export_order(self):
         self.assertEqual(self.my_resource.get_export_headers(),
-                ['email', 'name'])
+                ['email', 'name', 'extra'])
 
+    # Issue 140 Attributes aren't inherited by subclasses
+    def test_inheritance(self):
+        class A(MyResource):
+            inherited = fields.Field()
+
+            class Meta:
+                import_id_fields = ('email',)
+
+        class B(A):
+            local = fields.Field()
+
+            class Meta:
+                export_order = ('email', 'extra')
+
+        resource = B()
+        self.assertIn('name', resource.fields)
+        self.assertIn('inherited', resource.fields)
+        self.assertIn('local', resource.fields)
+        self.assertEqual(resource.get_export_headers(),
+                ['email', 'extra', 'name', 'inherited', 'local'])
+        self.assertEqual(resource._meta.import_id_fields, ('email',))
+
+    def test_inheritance_with_custom_attributes(self):
+        class A(MyResource):
+            inherited = fields.Field()
+
+            class Meta:
+                import_id_fields = ('email',)
+                custom_attribute = True
+
+        class B(A):
+            local = fields.Field()
+
+        resource = B()
+        self.assertEqual(resource._meta.custom_attribute, True)
 
 class BookResource(resources.ModelResource):
     published = fields.Field(column_name='published_date')
@@ -347,12 +383,14 @@ class ModelResourceTest(TestCase):
         class EntryResource(resources.ModelResource):
             class Meta:
                 model = Entry
-                fields = ('user__profile',)
+                fields = ('user__profile', 'user__profile__is_private')
 
         resource = EntryResource()
         dataset = resource.export(Entry.objects.all())
         self.assertEqual(dataset.dict[0]['user__profile'], profile.pk)
+        self.assertEqual(dataset.dict[0]['user__profile__is_private'], '1')
         self.assertEqual(dataset.dict[1]['user__profile'], '')
+        self.assertEqual(dataset.dict[1]['user__profile__is_private'], '')
 
     def test_empty_get_queryset(self):
         # issue #25 - Overriding queryset on export() fails when passed
@@ -389,6 +427,23 @@ class ModelResourceTest(TestCase):
         result = resource.import_data(dataset, raise_errors=True)
         self.assertFalse(result.has_errors())
         self.assertEqual(len(result.rows), 0)
+
+    def test_before_import_access_to_kwargs(self):
+        class B(BookResource):
+            def before_import(self, dataset, dry_run, **kwargs):
+                if 'extra_arg' in kwargs:
+                    dataset.headers[dataset.headers.index('author_email')] = 'old_email'
+                    dataset.insert_col(0,
+                                       lambda row: kwargs['extra_arg'],
+                                       header='author_email')
+
+        resource = B()
+        result = resource.import_data(self.dataset, raise_errors=True,
+                                      extra_arg='extra@example.com')
+        self.assertFalse(result.has_errors())
+        self.assertEqual(len(result.rows), 1)
+        instance = Book.objects.get(pk=self.book.pk)
+        self.assertEqual(instance.author_email, 'extra@example.com')
 
     def test_link_to_nonexistent_field(self):
         with self.assertRaises(FieldDoesNotExist) as cm:

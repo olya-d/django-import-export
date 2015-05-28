@@ -8,12 +8,12 @@ import traceback
 import tablib
 from diff_match_patch import diff_match_patch
 
+from django import VERSION
 from django.utils.safestring import mark_safe
 from django.utils import six
-from django.db import transaction
 from django.db.models.fields import FieldDoesNotExist
 from django.db.models.query import QuerySet
-from django.db.models.related import RelatedObject
+from django.db.transaction import TransactionManagementError
 from django.conf import settings
 
 from .results import Error, Result, RowResult
@@ -23,6 +23,18 @@ from .instance_loaders import (
     ModelInstanceLoader,
 )
 
+try:
+    from django.db.transaction import atomic, savepoint, savepoint_rollback, savepoint_commit  # noqa
+except ImportError:
+    from .django_compat import atomic, savepoint, savepoint_rollback, savepoint_commit  # noqa
+
+
+if VERSION < (1, 8):
+    from django.db.models.related import RelatedObject
+    ForeignObjectRel = RelatedObject
+else:
+    from django.db.models.fields.related import ForeignObjectRel
+    RelatedObject = None
 
 try:
     from django.utils.encoding import force_text
@@ -33,6 +45,17 @@ try:
     from collections import OrderedDict
 except ImportError:
     from django.utils.datastructures import SortedDict as OrderedDict
+
+# Set default logging handler to avoid "No handler found" warnings.
+import logging
+try:  # Python 2.7+
+    from logging import NullHandler
+except ImportError:
+    class NullHandler(logging.Handler):
+        def emit(self, record):
+            pass
+
+logging.getLogger(__name__).addHandler(NullHandler())
 
 USE_TRANSACTIONS = getattr(settings, 'IMPORT_EXPORT_USE_TRANSACTIONS', False)
 
@@ -83,22 +106,26 @@ class ResourceOptions(object):
     skip_unchanged = False
     report_skipped = True
 
-    def __new__(cls, meta=None):
-        overrides = {}
-
-        if meta:
-            for override_name in dir(meta):
-                if not override_name.startswith('_'):
-                    overrides[override_name] = getattr(meta, override_name)
-
-        return object.__new__(type(str('ResourceOptions'), (cls,), overrides))
-
 
 class DeclarativeMetaclass(type):
 
     def __new__(cls, name, bases, attrs):
         declared_fields = []
+        meta = ResourceOptions()
 
+        # If this class is subclassing another Resource, add that Resource's fields.
+        # Note that we loop over the bases in *reverse*. This is necessary in
+        # order to preserve the correct order of fields.
+        for base in bases[::-1]:
+            if hasattr(base, 'fields'):
+                declared_fields = list(six.iteritems(base.fields)) + declared_fields
+                # Collect the Meta options
+                options = getattr(base, 'Meta', None)
+                for option in [option for option in dir(options)
+                               if not option.startswith('_')]:
+                    setattr(meta, option, getattr(options, option))
+
+        # Add direct fields
         for field_name, obj in attrs.copy().items():
             if isinstance(obj, Field):
                 field = attrs.pop(field_name)
@@ -109,8 +136,13 @@ class DeclarativeMetaclass(type):
         attrs['fields'] = OrderedDict(declared_fields)
         new_class = super(DeclarativeMetaclass, cls).__new__(cls, name,
                 bases, attrs)
-        opts = getattr(new_class, 'Meta', None)
-        new_class._meta = ResourceOptions(opts)
+
+        # Add direct options
+        options = getattr(new_class, 'Meta', None)
+        for option in [option for option in dir(options) 
+                       if not option.startswith('_')]:
+            setattr(meta, option, getattr(options, option))
+        new_class._meta = meta
 
         return new_class
 
@@ -273,14 +305,15 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         """
         return self.get_export_headers()
 
-    def before_import(self, dataset, dry_run):
+    def before_import(self, dataset, dry_run, **kwargs):
         """
         Override to add additional logic.
         """
         pass
 
+    @atomic()
     def import_data(self, dataset, dry_run=False, raise_errors=False,
-            use_transactions=None):
+            use_transactions=None, **kwargs):
         """
         Imports data from ``dataset``.
 
@@ -299,23 +332,22 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
             # when transactions are used we want to create/update/delete object
             # as transaction will be rolled back if dry_run is set
             real_dry_run = False
-            transaction.enter_transaction_management()
-            transaction.managed(True)
+            sp1 = savepoint()
         else:
             real_dry_run = dry_run
 
-        instance_loader = self._meta.instance_loader_class(self, dataset)
-
         try:
-            self.before_import(dataset, real_dry_run)
+            self.before_import(dataset, real_dry_run, **kwargs)
         except Exception as e:
+            logging.exception(e)
             tb_info = traceback.format_exc(2)
             result.base_errors.append(Error(repr(e), tb_info))
             if raise_errors:
                 if use_transactions:
-                    transaction.rollback()
-                    transaction.leave_transaction_management()
+                    savepoint_rollback(sp1)
                 raise
+
+        instance_loader = self._meta.instance_loader_class(self, dataset)
 
         for row in dataset.dict:
             try:
@@ -350,12 +382,15 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
                     row_result.diff = self.get_diff(original, instance,
                             real_dry_run)
             except Exception as e:
+                # There is no point logging a transaction error for each row
+                # when only the original error is likely to be relevant
+                if not isinstance(e, TransactionManagementError):
+                    logging.exception(e)
                 tb_info = traceback.format_exc(2)
-                row_result.errors.append(Error(e, tb_info))
+                row_result.errors.append(Error(e, tb_info, row))
                 if raise_errors:
                     if use_transactions:
-                        transaction.rollback()
-                        transaction.leave_transaction_management()
+                        savepoint_rollback(sp1)
                     six.reraise(*sys.exc_info())
             if (row_result.import_type != RowResult.IMPORT_TYPE_SKIP or
                         self._meta.report_skipped):
@@ -363,15 +398,15 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
 
         if use_transactions:
             if dry_run or result.has_errors():
-                transaction.rollback()
+                savepoint_rollback(sp1)
             else:
-                transaction.commit()
-            transaction.leave_transaction_management()
+                savepoint_commit(sp1)
 
         return result
 
     def get_export_order(self):
-        return self._meta.export_order or self.fields.keys()
+        order = tuple (self._meta.export_order or ())
+        return order + tuple (k for k in self.fields.keys() if k not in order)
 
     def export_field(self, field, obj):
         field_name = self.get_field_name(field)
@@ -454,6 +489,7 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
                         try:
                             f = model._meta.get_field_by_name(attr)[0]
                         except FieldDoesNotExist as e:
+                            logging.exception(e)
                             raise FieldDoesNotExist("%s: %s has no field named '%s'" %
                                 (verbose_path, model.__name__, attr))
 
@@ -461,11 +497,18 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
                             # We're not at the last attribute yet, so check that
                             # we're looking at a relation, and move on to the
                             # next model.
-                            if f.rel is None:
-                                raise KeyError('%s is not a relation' % verbose_path)
-                            model = f.rel.to
+                            if isinstance(f, ForeignObjectRel):
+                                if RelatedObject is None:
+                                    model = f.related_model
+                                else:
+                                    # Django < 1.8
+                                    model = f.model
+                            else:
+                                if f.rel is None:
+                                    raise KeyError('%s is not a relation' % verbose_path)
+                                model = f.rel.to
 
-                    if isinstance(f, RelatedObject):
+                    if isinstance(f, ForeignObjectRel):
                         f = f.field
 
                     field = new_class.field_from_django_field(field_name, f,

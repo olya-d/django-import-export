@@ -58,6 +58,7 @@ class ImportExportAdminIntegrationTest(TestCase):
         confirm_form = response.context['confirm_form']
 
         data = confirm_form.initial
+        self.assertEqual(data['original_file_name'], 'books.csv')
         response = self.client.post('/admin/core/book/process_import/', data,
                 follow=True)
         self.assertEqual(response.status_code, 200)
@@ -73,6 +74,7 @@ class ImportExportAdminIntegrationTest(TestCase):
         response = self.client.post('/admin/core/book/export/', data)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.has_header("Content-Disposition"))
+        self.assertEqual(response['Content-Type'], 'text/csv')
 
     def test_import_export_buttons_visible_without_add_permission(self):
         # issue 38 - Export button not visible when no add permission
@@ -94,6 +96,7 @@ class ImportExportAdminIntegrationTest(TestCase):
         data = {
             'input_format': "0",
             'import_file_name': import_file_name,
+            'original_file_name': 'books.csv'
         }
         with self.assertRaises(IOError):
             self.client.post('/admin/core/book/process_import/', data)

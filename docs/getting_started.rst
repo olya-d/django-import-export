@@ -71,14 +71,39 @@ By default ``ModelResource`` introspects model fields and creates
 for each field.
 
 To affect which model fields will be included in an import-export
-resource, use the ``fields`` option to whitelist fields or ``exclude``
-option to blacklist fields::
+resource, use the ``fields`` option to whitelist fields::
+
+    class BookResource(resources.ModelResource):
+
+        class Meta:
+            model = Book
+            fields = ('id', 'name', 'price',)
+
+Or the ``exclude`` option to blacklist fields::
 
     class BookResource(resources.ModelResource):
 
         class Meta:
             model = Book
             exclude = ('imported', )
+
+An explicit order for exporting fields can be set using the ``export_order`` option::
+
+    class BookResource(resources.ModelResource):
+
+        class Meta:
+            model = Book
+            fields = ('id', 'name', 'author', 'price',)
+            export_order = ('id', 'price', 'author', 'name')
+
+The default field for object identification is ``id``, you can optionally set which fields are used as the ``id`` when importing::
+
+    class BookResource(resources.ModelResource):
+
+        class Meta:
+            model = Book
+            import_id_fields = ('isbn',)
+            fields = ('isbn', 'name', 'author', 'price',)
 
 When defining ``ModelResource`` fields it is possible to follow
 model relationships::
@@ -93,6 +118,19 @@ model relationships::
 
     Following relationship fields sets ``field`` as readonly, meaning
     this field will be skipped when importing data.
+
+By default all records will be imported, even if no changes are detected.
+This can be changed setting the ``skip_unchanged`` option. Also, the ``report_skipped`` option
+controls whether skipped records appear in the import ``Result`` object, and if using the admin
+whether skipped records will show in the import preview page::
+
+    class BookResource(resources.ModelResource):
+
+        class Meta:
+            model = Book
+            skip_unchanged = True
+            report_skipped = False
+            fields = ('id', 'name', 'price',)
 
 .. seealso::
 
@@ -145,7 +183,7 @@ data structure, ``dehydrate_<fieldname>`` method should be defined::
             model = Book
 
         def dehydrate_full_title(self, book):
-            return '%s by %s' % (book.name, book.name.author)
+            return '%s by %s' % (book.name, book.author.name)
 
 
 Customize widgets
